@@ -74,7 +74,8 @@ import {
   cleanStalePidFile,
   isProcessAlive,
   spawnDaemon,
-  createSignalHandler
+  createSignalHandler,
+  killPortHolder
 } from './infrastructure/ProcessManager.js';
 import {
   isPortInUse,
@@ -343,6 +344,11 @@ export class WorkerService {
   async start(): Promise<void> {
     const port = getWorkerPort();
     const host = getWorkerHost();
+
+    // On Windows: kill any process holding the port before binding.
+    // Prevents "address in use" errors after a crash where child processes
+    // inherited socket handles and kept the port bound (see GracefulShutdown.ts).
+    await killPortHolder(port);
 
     // Start HTTP server FIRST - make port available immediately
     await this.server.listen(port, host);
@@ -1140,13 +1146,32 @@ async function main() {
       });
 
       const worker = new WorkerService();
-      worker.start().catch((error) => {
-        logger.failure('SYSTEM', 'Worker failed to start', {}, error as Error);
-        removePidFile();
-        // Exit gracefully: Windows Terminal won't keep tab open on exit 0
-        // The wrapper/plugin will handle restart logic if needed
-        process.exit(0);
-      });
+      // On Windows, EADDRINUSE can be caused by a ghost socket (dead process still
+      // holding the port via SO_EXCLUSIVEADDRUSE). These clear naturally when all
+      // CLOSE_WAIT connections time out. Retry for up to 5 minutes before giving up.
+      const GHOST_RETRY_INTERVAL_MS = 15_000;
+      const GHOST_RETRY_TIMEOUT_MS = 5 * 60 * 1000;
+      const daemonStartTime = Date.now();
+      const tryStart = (): void => {
+        worker.start().then(() => {
+          // Worker started successfully — stay alive serving requests
+        }).catch((error) => {
+          const isAddrinuse = (error as NodeJS.ErrnoException)?.code === 'EADDRINUSE' ||
+            (error instanceof Error && error.message.includes('EADDRINUSE'));
+          const elapsed = Date.now() - daemonStartTime;
+          if (isAddrinuse && elapsed < GHOST_RETRY_TIMEOUT_MS) {
+            logger.warn('SYSTEM',
+              `Port ${port} still held by ghost socket, retrying in ${GHOST_RETRY_INTERVAL_MS / 1000}s ` +
+              `(${Math.round((GHOST_RETRY_TIMEOUT_MS - elapsed) / 1000)}s remaining)`, { port });
+            setTimeout(tryStart, GHOST_RETRY_INTERVAL_MS);
+          } else {
+            logger.failure('SYSTEM', 'Worker failed to start', {}, error as Error);
+            removePidFile();
+            process.exit(0);
+          }
+        });
+      };
+      tryStart();
     }
   }
 }

@@ -11,6 +11,7 @@
 
 import express, { Request, Response, Application } from 'express';
 import http from 'http';
+import net from 'net';
 import * as fs from 'fs';
 import path from 'path';
 import { ALLOWED_OPERATIONS, ALLOWED_TOPICS } from './allowed-constants.js';
@@ -71,6 +72,8 @@ export class Server {
   private server: http.Server | null = null;
   private readonly options: ServerOptions;
   private readonly startTime: number = Date.now();
+  // Track all open sockets for emergency cleanup on crash (prevents CLOSE_WAIT ghost sockets)
+  private readonly openSockets = new Set<net.Socket>();
 
   constructor(options: ServerOptions) {
     this.options = options;
@@ -92,6 +95,27 @@ export class Server {
   async listen(port: number, host: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.server = this.app.listen(port, host, () => {
+        // Track every connection so we can destroy them all on exit.
+        // process.on('exit') fires on process.exit(), uncaught exceptions, etc.
+        // Calling socket.destroy() sends RST instead of FIN, which prevents
+        // CLOSE_WAIT zombie sockets from accumulating on Windows after a crash
+        // (Bun uses SO_EXCLUSIVEADDRUSE; zombie sockets block port rebinding).
+        this.server!.on('connection', (socket: net.Socket) => {
+          this.openSockets.add(socket);
+          socket.once('close', () => this.openSockets.delete(socket));
+        });
+        process.on('exit', () => {
+          for (const socket of this.openSockets) {
+            try { socket.destroy(); } catch {}
+          }
+          try { this.server?.closeAllConnections(); } catch {}
+        });
+
+        // Short keep-alive timeout reduces open connections at any given time,
+        // limiting blast radius if the process exits without cleanup.
+        this.server!.keepAliveTimeout = 5000;
+        this.server!.headersTimeout = 6000;
+
         logger.info('SYSTEM', 'HTTP server started', { host, port, pid: process.pid });
         resolve();
       });

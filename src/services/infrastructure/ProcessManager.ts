@@ -603,6 +603,57 @@ export function runOneTimeChromaMigration(dataDirectory?: string): void {
 }
 
 /**
+ * Kill any process holding the specified port (Windows-specific).
+ *
+ * Called before server.listen() to prevent "address in use" errors after a crash
+ * where child processes inherited socket handles and kept the port bound.
+ * See GracefulShutdown.ts for context on why this happens on Windows.
+ */
+export async function killPortHolder(port: number): Promise<void> {
+  if (process.platform !== 'win32') return;
+
+  // SECURITY: Validate port is a positive integer to prevent command injection
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    logger.warn('SYSTEM', 'Invalid port for killPortHolder', { port });
+    return;
+  }
+
+  try {
+    const currentPid = process.pid;
+    // Find PIDs holding the port, skip 0 (system) and self, then:
+    // - Try to kill live processes
+    // - Log a warning for ghost PIDs (process is dead but socket remains)
+    //   Ghost sockets occur when Bun crashes with open CLOSE_WAIT connections.
+    //   They cannot be cleared without admin rights or a PC restart.
+    //   The 'exit' handler in Server.ts prevents new ghost sockets from forming.
+    const cmd = `powershell -NoProfile -NonInteractive -Command "` +
+      `$pids = Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue | ` +
+      `Select-Object -ExpandProperty OwningProcess -Unique | ` +
+      `Where-Object { $_ -ne 0 -and $_ -ne ${currentPid} }; ` +
+      `$pids | ForEach-Object { ` +
+        `if (Get-Process -Id $_ -ErrorAction SilentlyContinue) { ` +
+          `Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; Write-Output \\\"killed:$_\\\" ` +
+        `} else { Write-Output \\\"ghost:$_\\\" } ` +
+      `}"`;
+    const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND });
+    const lines = (stdout || '').trim().split('\n').filter(Boolean);
+    for (const line of lines) {
+      if (line.startsWith('ghost:')) {
+        logger.warn('SYSTEM', 'Ghost socket detected: dead process still holds port. ' +
+          'Cannot clear without admin/reboot. Prevented in future by Server exit handler.', { port, line });
+      } else if (line.startsWith('killed:')) {
+        logger.info('SYSTEM', 'Killed port holder process', { port, line });
+      }
+    }
+    // Give Windows time to release the port after killing live holders
+    await new Promise(r => setTimeout(r, 300));
+  } catch (error) {
+    // Non-critical: if cleanup fails, server.listen() will fail with a clear error
+    logger.debug('SYSTEM', 'Port holder cleanup failed (non-critical)', { port }, error as Error);
+  }
+}
+
+/**
  * Spawn a detached daemon process
  * Returns the child PID or undefined if spawn failed
  *
